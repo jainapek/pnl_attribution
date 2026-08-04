@@ -6,9 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "clickhouse-connect>=1.6.0",
+    "dash>=4.4.1",
     "dotenv>=0.9.9",
     "hvplot>=0.12.2",
     "matplotlib>=3.11.1",
     "pandas>=3.0.5",
     "plotly>=6.9.0",
 ]
+
+[project.scripts]
+pnl-attribution = "pnl_attribution.cli:main"
