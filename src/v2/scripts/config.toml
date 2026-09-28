@@ -1,0 +1,58 @@
+# Nexus cycle attribution — shared constants
+
+[contract]
+size = 1000                 # barrels per lot
+clearing_rate = 0.0019      # $/bbl exchange / clearing add-on
+
+[books]
+# name → tradr book_id (reference; intentions are keyed by book name)
+"Hedger Spreads" = 129
+"Spreadgr Base" = 318
+"Spreadgr Alt 1" = 309
+"Spreadgr Alt 2" = 332
+"Spreadgr Alt 3" = 339
+"Spreadgr Alt 4" = 342
+"Spreadgr Base 1" = 341
+"Spreadgr Base 2" = 337
+"Spreadgr Base 3" = 340
+"Spreadgr Base 4" = 343
+
+[stages]
+# TOTAL is synthesized; peel order for day tables
+order = ["TOTAL", "transfer_pred", "pca", "routing"]
+peels = ["transfer_pred", "pca", "routing"]
+
+[summary_components]
+# columns under each stage in the day / book summary table
+# value_added = in_exec − (out_exec − held_market_risk − held_exec_save)
+# held_market_risk is PnL (+ = gain), so it offsets residual cost
+order = [
+  "in_exec_cost",
+  "out_exec_cost",
+  "held_market_risk",
+  "held_exec_save",
+  "value_added_by_strategy",
+]
+
+[curves]
+product = "Brent_(Fut)"
+table = "algo.curves"
+
+[quotes]
+# prefer mdc; fall back to mdcoll
+primary_table = "mdc.top5pl"
+primary_price_scale = 100.0
+fallback_table = "mdcoll.brn_top5pl"
+fallback_price_scale = 1.0
+lookback_minutes = 30
+hub_alias = "North Sea"
+security_sub_type = "SPR"
+
+[intentions]
+table = "algo.nexus_book_position_intentions_v1"
+
+[clickhouse]
+# defaults; overridden by env (CLICKHOUSE_*)
+host = "10.20.0.243"
+port = 8123
+database = "algo"
