@@ -24,8 +24,8 @@ peels = ["transfer_pred", "pca", "routing"]
 
 [summary_components]
 # columns under each stage in the day / book summary table
-# value_added = in_exec − (out_exec − held_market_risk − held_exec_save)
-# held_market_risk is PnL (+ = gain), so it offsets residual cost
+# value_added = in_exec − (out_exec + held_market_risk + held_exec_save)
+# all exec_* are cashflows (+ = money in); held_market_risk + = MTM gain
 order = [
   "in_exec_cost",
   "out_exec_cost",

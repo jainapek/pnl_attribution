@@ -8,21 +8,45 @@ from .config import CONFIG, AppConfig
 from .spreads import series_from_row
 
 
-def half_spread_on_tenors(
+def _scalar(val) -> float:
+    """Coerce a loc result that may be a 1-element Series/DataFrame to float."""
+    if isinstance(val, pd.DataFrame):
+        val = val.iloc[-1]
+    if isinstance(val, pd.Series):
+        val = val.iloc[-1] if len(val) > 1 else val.item()
+    return float(val)
+
+
+def l1_bid_ask_on_tenors(
     bid_ask: pd.DataFrame,
     tenors: pd.DatetimeIndex,
-) -> pd.Series:
-    """Half bid/ask for consecutive-month spreads keyed by front month."""
-    vals: dict[pd.Timestamp, float] = {}
+) -> tuple[pd.Series, pd.Series]:
+    """L1 bid/ask for consecutive-month spreads keyed by front month."""
+    bids: dict[pd.Timestamp, float] = {}
+    asks: dict[pd.Timestamp, float] = {}
     for t in tenors:
         start = pd.Timestamp(t).normalize()
         end = (start + pd.DateOffset(months=1)).normalize()
         key = (start, end)
-        if not bid_ask.empty and key in bid_ask.index:
-            vals[start] = float(bid_ask.loc[key, "spread"]) / 2.0
-        else:
-            vals[start] = float("nan")
-    return pd.Series(vals)
+        if bid_ask.empty or key not in bid_ask.index:
+            bids[start] = float("nan")
+            asks[start] = float("nan")
+            continue
+        row = bid_ask.loc[key]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        bids[start] = _scalar(row["bid"])
+        asks[start] = _scalar(row["ask"])
+    return pd.Series(bids), pd.Series(asks)
+
+
+def half_spread_on_tenors(
+    bid_ask: pd.DataFrame,
+    tenors: pd.DatetimeIndex,
+) -> pd.Series:
+    """Half bid/ask (legacy helper)."""
+    bid, ask = l1_bid_ask_on_tenors(bid_ask, tenors)
+    return (ask - bid) / 2.0
 
 
 def abs_lots(pos_df: pd.DataFrame) -> float:
@@ -47,19 +71,44 @@ def exec_cost(
     bid_ask: pd.DataFrame,
     cfg: AppConfig | None = None,
 ) -> dict[str, float]:
-    """Half-spread + exchange cost on abs lots."""
+    """Taker cashflow + exchange on a signed position.
+
+    Per tenor (cross the spread), **cashflow** (+ = money in):
+        pos > 0 (buy):  −ask × pos × size   (spend)
+        pos < 0 (sell): −bid × pos × size   (= +bid × |pos| × size, receive)
+    Clearing is always a cost:
+        − clearing_rate × |pos| × size
+
+    Missing L1 quotes contribute 0 for that tenor's touch leg.
+    """
     c = cfg or CONFIG
     pos = series_from_row(pos_df)
-    half = half_spread_on_tenors(bid_ask, pos.index).reindex(pos.index)
-    half_spread_cost = float(
-        (pos.abs() * c.contract.size * half.fillna(0.0)).sum()
-    )
+    if pos.empty:
+        return {
+            "touch_cash": 0.0,
+            "exchange_cost": 0.0,
+            "exec_cost": 0.0,
+            "abs_lots": 0.0,
+        }
+
+    bid, ask = l1_bid_ask_on_tenors(bid_ask, pos.index)
+    bid = bid.reindex(pos.index)
+    ask = ask.reindex(pos.index)
+
+    touch = pd.Series(index=pos.index, dtype=float)
+    buy = pos > 0
+    sell = pos < 0
+    touch.loc[buy] = ask.loc[buy]
+    touch.loc[sell] = bid.loc[sell]
+
+    # cashflow: −pos×touch×size  (buy→negative, sell→positive)
+    touch_cash = float((-pos * c.contract.size * touch.fillna(0.0)).sum())
     exchange_cost = float(
-        (pos.abs() * c.contract.size * c.contract.clearing_rate).sum()
+        -(pos.abs() * c.contract.size * c.contract.clearing_rate).sum()
     )
     return {
-        "half_spread_cost": round(half_spread_cost, 2),
+        "touch_cash": round(touch_cash, 2),
         "exchange_cost": round(exchange_cost, 2),
-        "exec_cost": round(half_spread_cost + exchange_cost, 2),
+        "exec_cost": round(touch_cash + exchange_cost, 2),
         "abs_lots": float(pos.abs().sum()),
     }
