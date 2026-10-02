@@ -12,10 +12,12 @@ from .cycle_attribution import attribute_cycle, with_cents_per_bbl
 from .intentions import cycles_for_day, load_intentions_for_day
 from .market_cache import (
     DayMarketCache,
-    load_curve_asof_many,
     load_day_market_cache,
     load_quote_cache_for_day,
 )
+from .trades import executed_lots_series, load_trades_for_book_day
+from .transfers import load_transfers_for_book_day
+from .costs import executed_fill_market_risk_by_instrument
 
 
 def _empty_book_frame(cfg: AppConfig) -> pd.DataFrame:
@@ -25,6 +27,18 @@ def _empty_book_frame(cfg: AppConfig) -> pd.DataFrame:
     )
     empty = pd.DataFrame(columns=dollar_cols)
     return with_cents_per_bbl(empty, pd.Series(dtype=float), cfg)
+
+
+def _to_utc(ts) -> pd.Timestamp:
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        return t.tz_localize("UTC")
+    return t.tz_convert("UTC")
+
+
+def _naive_utc(ts) -> pd.Timestamp:
+    """Aware → UTC then drop tz; naive treated as UTC wall time."""
+    return _to_utc(ts).tz_localize(None)
 
 
 def attribute_book_day(
@@ -39,7 +53,11 @@ def attribute_book_day(
     """All cycles for one book / day.
 
     Prefetches curves + quote minute-bars once (unless ``market`` is passed),
-    then attributes in-process.
+    then attributes in-process. Also loads the day's nexus trades and
+    transfers once so each cycle gets:
+    - fills in ``(timestamp, next_cycle_start]`` → unexecuted / executed MR /
+      mark_to_exec
+    - transfers in ``(prev_cycle, timestamp]`` → transfer_vs_mark
 
     Index: ``cycle_id`` (+ ``DAY TOTAL``).
     Columns: MultiIndex ``(unit, stage, component)`` with ``unit`` in
@@ -55,24 +73,80 @@ def attribute_book_day(
         pd.Timestamp(t)
         for t in pd.concat([cycles["timestamp"], cycles["next_cycle_start"]])
     ]
+
+    trades = load_trades_for_book_day(client, book, asof_date)
+    fill_times: list[pd.Timestamp] = []
+    if not trades.empty:
+        trades = trades.copy()
+        trades["transaction_timestamp"] = [
+            _naive_utc(t) for t in trades["transaction_timestamp"]
+        ]
+        fill_times = [pd.Timestamp(t) for t in trades["transaction_timestamp"]]
+
+    transfers = load_transfers_for_book_day(client, book, asof_date)
+    xfer_times: list[pd.Timestamp] = []
+    if not transfers.empty:
+        transfers = transfers.copy()
+        transfers["timestamp"] = [_naive_utc(t) for t in transfers["timestamp"]]
+        xfer_times = [pd.Timestamp(t) for t in transfers["timestamp"]]
+
+    extra_asof = fill_times + xfer_times
     if market is None:
         print(f"  {book}: prefetching market data ({len(cycles)} cycles)…")
-        market = load_day_market_cache(client, asof_date, cycle_times, c)
+        market = load_day_market_cache(
+            client, asof_date, cycle_times, c, extra_asof=extra_asof
+        )
     else:
         print(f"  {book}: prefetching curves ({len(cycles)} cycles)…")
+        from .market_cache import load_curve_asof_many
+
         market = DayMarketCache(
-            curves=load_curve_asof_many(client, cycle_times, c.curves),
+            curves=load_curve_asof_many(
+                client, cycle_times + extra_asof, c.curves
+            ),
             quotes=market.quotes,
         )
 
     rows: list[pd.Series] = []
     lots: list[float] = []
     ids: list = []
+    prev_ts: pd.Timestamp | None = None
     for i, (_, row) in enumerate(cycles.iterrows(), start=1):
-        s, abs_traded = attribute_cycle(client, row, c, market=market)
+        t0 = _naive_utc(row["timestamp"])
+        t1 = _naive_utc(row["next_cycle_start"])
+        if trades.empty:
+            gap = trades
+            fills = pd.Series(dtype=float)
+        else:
+            gap = trades[
+                (trades["transaction_timestamp"] > t0)
+                & (trades["transaction_timestamp"] <= t1)
+            ]
+            fills = executed_lots_series(gap)
+
+        if transfers.empty:
+            xfer_gap = transfers
+        elif prev_ts is None:
+            xfer_gap = transfers[transfers["timestamp"] <= t0]
+        else:
+            xfer_gap = transfers[
+                (transfers["timestamp"] > prev_ts)
+                & (transfers["timestamp"] <= t0)
+            ]
+
+        s, abs_traded = attribute_cycle(
+            client,
+            row,
+            c,
+            market=market,
+            fills=fills,
+            fill_trades=gap,
+            cycle_transfers=xfer_gap,
+        )
         rows.append(s)
         lots.append(abs_traded)
         ids.append(row["cycle_id"])
+        prev_ts = t0
         if progress_every and i % progress_every == 0:
             print(f"  {book}: {i}/{len(cycles)} cycles")
 
@@ -91,6 +165,102 @@ def attribute_book_day(
     dollars.loc["DAY TOTAL"] = dollars.sum(numeric_only=True)
     abs_lots_s.loc["DAY TOTAL"] = float(abs_lots_s.sum())
     return with_cents_per_bbl(dollars, abs_lots_s, c)
+
+
+def executed_mr_by_instrument_book_day(
+    client: Client,
+    asof_date: date,
+    book: str,
+    cfg: AppConfig | None = None,
+    *,
+    market: DayMarketCache | None = None,
+) -> pd.DataFrame:
+    """Day ``executed_mr`` split by ``nexus_trades.instrument_key``.
+
+    Same cycle windows and sign as day attribution. Packs stay under the
+    raw multi-month contract string. Returns columns
+    ``executed_mr``, ``n_fills``, ``abs_lots``, ``c/bbl`` sorted by |executed_mr|.
+    Index is contracts only (no TOTAL row).
+    """
+    c = cfg or CONFIG
+    intentions = load_intentions_for_day(client, asof_date, book, c.intentions)
+    if intentions.empty:
+        return pd.DataFrame(columns=["executed_mr", "n_fills", "abs_lots"])
+
+    cycles = cycles_for_day(intentions, asof_date)
+    cycle_times = [
+        pd.Timestamp(t)
+        for t in pd.concat([cycles["timestamp"], cycles["next_cycle_start"]])
+    ]
+
+    trades = load_trades_for_book_day(client, book, asof_date)
+    fill_times: list[pd.Timestamp] = []
+    if not trades.empty:
+        trades = trades.copy()
+        trades["transaction_timestamp"] = [
+            _naive_utc(t) for t in trades["transaction_timestamp"]
+        ]
+        fill_times = [pd.Timestamp(t) for t in trades["transaction_timestamp"]]
+
+    if market is None:
+        market = load_day_market_cache(
+            client, asof_date, cycle_times, c, extra_asof=fill_times
+        )
+    elif fill_times:
+        from .market_cache import load_curve_asof_many
+
+        market = DayMarketCache(
+            curves=load_curve_asof_many(
+                client, cycle_times + fill_times, c.curves
+            ),
+            quotes=market.quotes,
+        )
+
+    pnl_acc: dict[str, float] = {}
+    fill_acc: dict[str, int] = {}
+    lots_acc: dict[str, float] = {}
+
+    for _, row in cycles.iterrows():
+        t0 = _naive_utc(row["timestamp"])
+        t1 = _naive_utc(row["next_cycle_start"])
+        if trades.empty:
+            continue
+        gap = trades[
+            (trades["transaction_timestamp"] > t0)
+            & (trades["transaction_timestamp"] <= t1)
+        ]
+        if gap.empty:
+            continue
+        by_inst = executed_fill_market_risk_by_instrument(
+            gap, t0, market.curves, c
+        )
+        for ikey, pnl in by_inst.items():
+            pnl_acc[ikey] = pnl_acc.get(ikey, 0.0) + float(pnl)
+        for ikey, grp in gap.groupby("instrument_key"):
+            key = str(ikey)
+            fill_acc[key] = fill_acc.get(key, 0) + int(len(grp))
+            lots_acc[key] = lots_acc.get(key, 0.0) + float(
+                grp["quantity"].astype(float).abs().sum()
+            )
+
+    if not pnl_acc:
+        return pd.DataFrame(columns=["executed_mr", "n_fills", "abs_lots"])
+
+    out = pd.DataFrame(
+        {
+            "executed_mr": pd.Series(pnl_acc, dtype=float),
+            "n_fills": pd.Series(fill_acc, dtype=float),
+            "abs_lots": pd.Series(lots_acc, dtype=float),
+        }
+    )
+    out.index.name = "instrument_key"
+    out = out.fillna(0.0)
+    out["n_fills"] = out["n_fills"].astype(int)
+    out = out.sort_values("executed_mr", key=lambda s: s.abs(), ascending=False)
+    # slippage sign: +c/bbl = cost, −c/bbl = gain (same as day tables)
+    bbls = out["abs_lots"].astype(float) * c.contract.size
+    out["c/bbl"] = (-out["executed_mr"] / bbls.where(bbls > 0) * 100.0).round(4)
+    return out.round({"executed_mr": 2, "abs_lots": 2})
 
 
 def attribute_all_books_day(
@@ -113,8 +283,10 @@ def attribute_all_books_day(
 
     print(f"prefetching quote bars for {asof_date}…")
     shared_quotes = load_quote_cache_for_day(client, asof_date, c.quotes)
+    from .market_cache import CurveAsofCache
+
     shared = DayMarketCache(
-        curves=load_curve_asof_many(client, [], c.curves),
+        curves=CurveAsofCache({}),
         quotes=shared_quotes,
     )
 

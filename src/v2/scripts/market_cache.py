@@ -16,11 +16,17 @@ from .config import CONFIG, AppConfig, CurvesConfig, QuotesConfig
 
 
 def _naive(ts: pd.Timestamp) -> pd.Timestamp:
-    """Drop tz while keeping wall-clock time (no UTC shift)."""
+    """Normalise to tz-naive UTC wall time for ClickHouse ``DateTime64(..., 'UTC')``."""
     t = pd.Timestamp(ts)
     if t.tzinfo is not None:
-        t = t.replace(tzinfo=None)
+        t = t.tz_convert("UTC").tz_localize(None)
     return t
+
+
+def _ch_dt64_utc(ts: pd.Timestamp) -> str:
+    """SQL literal: UTC-naive timestamp as DateTime64(3, 'UTC')."""
+    t = _naive(ts)
+    return f"toDateTime64('{t}', 3, 'UTC')"
 
 
 def _curve_map_to_spreads(curve_map) -> pd.Series:
@@ -139,14 +145,28 @@ class QuoteMinuteCache:
 
 @dataclass
 class CurveAsofCache:
-    """Spread curves keyed by requested asof timestamps."""
+    """Spread curves with exact asof hits and/or a day timeline for arbitrary asof."""
 
     spreads_by_asof: dict[pd.Timestamp, pd.Series]
+    timeline_ts: np.ndarray | None = None
+    timeline_spreads: list[pd.Series] | None = None
 
     def asof(self, t: pd.Timestamp) -> pd.Series | None:
-        return self.spreads_by_asof.get(_naive(t))
+        key = _naive(t)
+        hit = self.spreads_by_asof.get(key)
+        if hit is not None:
+            return hit
+        if self.timeline_ts is None or self.timeline_spreads is None:
+            return None
+        if len(self.timeline_ts) == 0:
+            return None
+        i = int(np.searchsorted(self.timeline_ts, np.datetime64(key), side="right") - 1)
+        if i < 0:
+            return None
+        return self.timeline_spreads[i]
 
     def move(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+        """``spread_later − spread_start`` (m2m gain on a long)."""
         s0 = self.asof(start)
         s1 = self.asof(end)
         if s0 is None or s1 is None:
@@ -173,7 +193,7 @@ def load_curve_asof_many(
     if not times:
         return CurveAsofCache({})
 
-    arr = ", ".join(f"toDateTime64('{t}', 3)" for t in times)
+    arr = ", ".join(_ch_dt64_utc(t) for t in times)
     raw = client.query_df(
         f"""
         WITH times AS (
@@ -187,8 +207,8 @@ def load_curve_asof_many(
             SELECT timestamp, curve, toUInt8(1) AS k
             FROM {c.table}
             WHERE product = '{c.product}'
-              AND timestamp >= toDateTime64('{times[0]}', 3) - INTERVAL 6 HOUR
-              AND timestamp <= toDateTime64('{times[-1]}', 3)
+              AND timestamp >= {_ch_dt64_utc(times[0])} - INTERVAL 6 HOUR
+              AND timestamp <= {_ch_dt64_utc(times[-1])}
         ) AS c ON t.k = c.k AND t.t >= c.timestamp
         """
     )
@@ -198,6 +218,44 @@ def load_curve_asof_many(
             continue
         out[_naive(row.as_of)] = _curve_map_to_spreads(row.curve)
     return CurveAsofCache(out)
+
+
+def load_curve_timeline(
+    client: Client,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    cfg: CurvesConfig | None = None,
+) -> CurveAsofCache:
+    """All curve snapshots in ``[start − 6h, end]`` for arbitrary asof lookup."""
+    c = cfg or CONFIG.curves
+    start = _naive(start)
+    end = _naive(end)
+    raw = client.query_df(
+        f"""
+        SELECT timestamp, curve
+        FROM {c.table}
+        WHERE product = '{c.product}'
+          AND timestamp >= {_ch_dt64_utc(start)} - INTERVAL 6 HOUR
+          AND timestamp <= {_ch_dt64_utc(end)}
+        ORDER BY timestamp
+        """
+    )
+    if raw.empty:
+        return CurveAsofCache({})
+    ts_list: list[pd.Timestamp] = []
+    spreads: list[pd.Series] = []
+    for row in raw.itertuples(index=False):
+        if row.curve is None:
+            continue
+        ts_list.append(_naive(row.timestamp))
+        spreads.append(_curve_map_to_spreads(row.curve))
+    if not ts_list:
+        return CurveAsofCache({})
+    return CurveAsofCache(
+        spreads_by_asof={},
+        timeline_ts=np.asarray(ts_list, dtype="datetime64[ns]"),
+        timeline_spreads=spreads,
+    )
 
 
 def load_quote_minute_bars(
@@ -266,9 +324,14 @@ def load_day_market_cache(
     asof_date: date,
     cycle_times: list[pd.Timestamp],
     cfg: AppConfig | None = None,
+    *,
+    extra_asof: list[pd.Timestamp] | None = None,
 ) -> DayMarketCache:
-    """Curves at all cycle bounds + quote minute bars for the day."""
+    """Curves at cycle bounds (+ optional fill times) and quote bars for the day."""
     c = cfg or CONFIG
-    curves = load_curve_asof_many(client, cycle_times, c.curves)
+    times = list(cycle_times)
+    if extra_asof:
+        times.extend(extra_asof)
+    curves = load_curve_asof_many(client, times, c.curves)
     quotes = load_quote_cache_for_day(client, asof_date, c.quotes)
     return DayMarketCache(curves=curves, quotes=quotes)

@@ -22,12 +22,15 @@ def load_curve_as_of(
         return None, None, None
 
     c = cfg or CONFIG.curves
+    as_of_naive = pd.Timestamp(as_of)
+    if as_of_naive.tzinfo is not None:
+        as_of_naive = as_of_naive.tz_convert("UTC").tz_localize(None)
     row = client.query_df(
         f"""
         SELECT timestamp, curve
         FROM {c.table}
         WHERE product = '{c.product}'
-          AND timestamp <= '{as_of}'
+          AND timestamp <= toDateTime64('{as_of_naive}', 3, 'UTC')
         ORDER BY timestamp DESC
         LIMIT 1
         """
@@ -49,7 +52,10 @@ def curve_move(
     end: pd.Timestamp,
     cfg: CurvesConfig | None = None,
 ) -> pd.Series:
-    """Spread-curve move from ``start`` to ``end`` (end − start)."""
+    """Spread move vs cycle-start mark: ``spread_later − spread_start``.
+
+    Same sign as library m2m (live BV − BOD BV): positive = gain on a long.
+    """
     _, _, s0 = load_curve_as_of(client, start, cfg)
     _, _, s1 = load_curve_as_of(client, end, cfg)
     if s0 is None or s1 is None:

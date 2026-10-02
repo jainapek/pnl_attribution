@@ -19,17 +19,26 @@ clearing_rate = 0.0019      # $/bbl exchange / clearing add-on
 
 [stages]
 # TOTAL is synthesized; peel order for day tables
-order = ["TOTAL", "transfer_pred", "pca", "routing"]
+order = ["TOTAL", "transfer_pred", "pca", "routing", "executed"]
 peels = ["transfer_pred", "pca", "routing"]
+# executed is not a peel: held_market_risk marks unexecuted; executed_market_risk
+# marks fills from cycle-start curve to curve at each fill time
 
 [summary_components]
 # columns under each stage in the day / book summary table
-# value_added = in_exec − (out_exec + held_market_risk + held_exec_save)
-# all exec_* are cashflows (+ = money in); held_market_risk + = MTM gain
+# value_added = in_exec − out_exec + held_market_risk + executed_market_risk
+#               + mark_to_exec + transfer_vs_mark − held_exec_save
+# all exec_* are cashflows (+ = money in)
+# market-risk columns: vs cycle-start mark (later − start); + = gain on longs (library m2m)
+# mark_to_exec: fill vs curve at fill (price/n per 1m leg); executed stage only
+# transfer_vs_mark: transfer deal vs nexus_transfers.mark (price/n); ≈ −edge; transfer_pred only
 order = [
   "in_exec_cost",
   "out_exec_cost",
   "held_market_risk",
+  "executed_market_risk",
+  "mark_to_exec",
+  "transfer_vs_mark",
   "held_exec_save",
   "value_added_by_strategy",
 ]

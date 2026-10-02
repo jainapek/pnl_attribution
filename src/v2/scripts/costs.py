@@ -59,11 +59,143 @@ def market_risk(
     curve_move: pd.Series,
     cfg: AppConfig | None = None,
 ) -> float:
-    """Signed MTM on held: Σ pos × size × Δspread (+ = gain)."""
+    """Signed MTM vs cycle-start mark: Σ pos × size × (later − start).
+
+    ``curve_move`` is ``spread_later − spread_start`` (or fill − start).
+    Positive = gain on a long (+lots), same sign as library m2m.
+    """
     c = cfg or CONFIG
     pos = series_from_row(pos_df).reindex(curve_move.index).fillna(0.0)
     move = curve_move.reindex(pos.index).fillna(0.0)
     return round(float((pos * c.contract.size * move).sum()), 2)
+
+
+def executed_fill_market_risk_by_instrument(
+    trades: pd.DataFrame,
+    cycle_start: pd.Timestamp,
+    curve_asof,
+    cfg: AppConfig | None = None,
+) -> pd.Series:
+    """Same $ as ``executed_fill_market_risk``, keyed by ``instrument_key``.
+
+    Packs stay under the raw nexus_trades contract string; 1m legs are
+    expanded only for marking, then summed back onto that instrument.
+    """
+    from .trades import iter_fill_legs_priced
+
+    c = cfg or CONFIG
+    if trades is None or len(trades) == 0:
+        return pd.Series(dtype=float)
+    s0 = curve_asof.asof(cycle_start)
+    if s0 is None or s0.empty:
+        return pd.Series(dtype=float)
+    s0 = s0.copy()
+    s0.index = pd.DatetimeIndex(s0.index).normalize()
+
+    acc: dict[str, float] = {}
+    for fill_ts, tenor, lots, _price, ikey in iter_fill_legs_priced(trades):
+        s1 = curve_asof.asof(fill_ts)
+        if s1 is None or s1.empty:
+            continue
+        s1 = s1.copy()
+        s1.index = pd.DatetimeIndex(s1.index).normalize()
+        v0 = float(s0.reindex([tenor]).fillna(0.0).iloc[0])
+        v1 = float(s1.reindex([tenor]).fillna(0.0).iloc[0])
+        acc[ikey] = acc.get(ikey, 0.0) + (-lots) * c.contract.size * (v1 - v0)
+    if not acc:
+        return pd.Series(dtype=float)
+    out = pd.Series(acc, dtype=float).sort_values(key=lambda s: s.abs(), ascending=False)
+    return out.round(2)
+
+
+def executed_fill_market_risk(
+    trades: pd.DataFrame,
+    cycle_start: pd.Timestamp,
+    curve_asof,
+    cfg: AppConfig | None = None,
+) -> float:
+    """MTM on risk held while waiting for fills: cycle-start → fill.
+
+    Fills *close* book risk, so inventory during the wait has the **opposite**
+    sign to the fill (long risk waiting to sell, etc.):
+
+        Σ (−fill_lots) × size × (mark_fill − mark_start)
+
+    Buy fill → +lots → inventory −lots while waiting. Positive = gain on that
+    residual risk (library m2m sign).
+    """
+    by_inst = executed_fill_market_risk_by_instrument(
+        trades, cycle_start, curve_asof, cfg
+    )
+    if by_inst.empty:
+        return 0.0
+    return round(float(by_inst.sum()), 2)
+
+def mark_to_exec(
+    trades: pd.DataFrame,
+    curve_asof,
+    cfg: AppConfig | None = None,
+) -> float:
+    """Fill price vs curve mark at fill: Σ lots × size × (mark − price/n).
+
+    Pack prices are sums of 1m spreads, so each consecutive leg is marked
+    against ``price / n_legs``. Buy → +lots: positive = bought below mark
+    (good exec). Same PnL sign as library m2m (+ = gain).
+    """
+    from .trades import iter_fill_legs_priced
+
+    c = cfg or CONFIG
+    if trades is None or len(trades) == 0:
+        return 0.0
+
+    total = 0.0
+    for fill_ts, tenor, lots, price_1m, _ikey in iter_fill_legs_priced(trades):
+        s1 = curve_asof.asof(fill_ts)
+        if s1 is None or s1.empty:
+            continue
+        s1 = s1.copy()
+        s1.index = pd.DatetimeIndex(s1.index).normalize()
+        mark = float(s1.reindex([tenor]).fillna(0.0).iloc[0])
+        total += lots * c.contract.size * (mark - price_1m)
+    return round(total, 2)
+
+
+def transfer_vs_mark(
+    transfers: pd.DataFrame,
+    curve_asof=None,
+    cfg: AppConfig | None = None,
+) -> float:
+    """Transfer deal price vs Nexus transfer mark: Σ lots × size × (mark − price)/n.
+
+    Transfers are booked at the row ``mark`` (curve used at booking), so this
+    is essentially −edge and should be small. Pack prices/marks are sums of
+    1m legs → per-leg ``/ n``. ``curve_asof`` is unused (kept for call-site
+    symmetry with ``mark_to_exec``); pure-mark / skew vs ``algo.curves`` is
+    a separate split later.
+    """
+    from .trades import pack_to_consecutive_lots
+    from .transfers import book_signed_qty
+
+    c = cfg or CONFIG
+    if transfers is None or len(transfers) == 0:
+        return 0.0
+
+    total = 0.0
+    for row in transfers.itertuples(index=False):
+        start = pd.Timestamp(getattr(row, "start_tenor")).normalize()
+        end = pd.Timestamp(getattr(row, "end_tenor")).normalize()
+        signed = book_signed_qty(getattr(row, "side"), getattr(row, "quantity"))
+        if signed == 0.0:
+            continue
+        legs = pack_to_consecutive_lots(start, end, signed)
+        n = len(legs)
+        if n == 0:
+            continue
+        price_1m = float(getattr(row, "price")) / n
+        mark_1m = float(getattr(row, "mark")) / n
+        for _tenor, lots in legs.items():
+            total += float(lots) * c.contract.size * (mark_1m - price_1m)
+    return round(total, 2)
 
 
 def exec_cost(
