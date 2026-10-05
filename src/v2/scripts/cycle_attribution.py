@@ -12,6 +12,7 @@ from .costs import (
     executed_fill_market_risk,
     mark_to_exec,
     market_risk,
+    transfer_timing_mr,
     transfer_vs_mark,
 )
 from .curves import curve_move
@@ -44,6 +45,7 @@ def stage_summary(
     executed_mr: float = 0.0,
     mark_to_exec_pnl: float = 0.0,
     transfer_vs_mark_pnl: float = 0.0,
+    transfer_timing_mr_pnl: float = 0.0,
 ) -> pd.DataFrame:
     """Per-stage summary; index ordered with TOTAL first.
 
@@ -62,14 +64,17 @@ def stage_summary(
         transfer_vs_mark (transfer_pred stage only)
             = Σ xfer_lots × size × (transfer.mark − price)/n
               (Nexus booking mark, not algo.curves; ≈ −edge)
+        transfer_timing_mr (transfer_pred stage only)
+            = Σ xfer_lots × size × (mark_asof(cycle_start) − mark_asof(xfer_ts))
 
     value_added_by_strategy
         = in_exec_cost − out_exec_cost + held_market_risk
           + executed_market_risk + mark_to_exec + transfer_vs_mark
-          − held_exec_save
+          + transfer_timing_mr − held_exec_save
     """
     c = cfg or CONFIG
     tvm = float(transfer_vs_mark_pnl)
+    ttm = float(transfer_timing_mr_pnl)
     rows = []
     for name in c.peel_stages:
         book = stages[name]
@@ -77,8 +82,9 @@ def stage_summary(
         out_x = exec_cost(book["out"], bid_ask, c)["exec_cost"]
         held_x = exec_cost(book["held"], bid_ask, c)["exec_cost"]
         mr = market_risk(book["held"], curve_move_s, c)
-        # receive-vs-mark lives on the first peel (where position_received enters)
+        # receive-vs-mark / receive-timing live on the first peel
         tvm_here = tvm if name == "transfer_pred" else 0.0
+        ttm_here = ttm if name == "transfer_pred" else 0.0
         rows.append(
             {
                 "stage": name,
@@ -88,9 +94,10 @@ def stage_summary(
                 "executed_market_risk": 0.0,
                 "mark_to_exec": 0.0,
                 "transfer_vs_mark": tvm_here,
+                "transfer_timing_mr": ttm_here,
                 "held_exec_save": held_x,
                 "value_added_by_strategy": round(
-                    in_x - out_x + mr + tvm_here - held_x, 2
+                    in_x - out_x + mr + tvm_here + ttm_here - held_x, 2
                 ),
             }
         )
@@ -109,6 +116,7 @@ def stage_summary(
                 "executed_market_risk": mr_exec,
                 "mark_to_exec": m2e,
                 "transfer_vs_mark": 0.0,
+                "transfer_timing_mr": 0.0,
                 "held_exec_save": 0.0,
                 "value_added_by_strategy": round(mr_unexec + mr_exec + m2e, 2),
             }
@@ -135,8 +143,9 @@ def attribute_cycle(
     Pass ``fills`` / ``fill_trades`` for the gap ``(timestamp, next_cycle_start]``:
     aggregated fills build ``unexecuted``; raw ``fill_trades`` mark
     ``executed_market_risk`` / ``mark_to_exec``.
-    Pass ``cycle_transfers`` for ``(prev_cycle, timestamp]`` receive flow →
-    ``transfer_vs_mark``.
+    Pass ``cycle_transfers`` already assigned to this cycle. ``timestamp`` /
+    ``next_cycle_start`` on ``row`` should be the effective window
+    (start = min(intention, earliest transfer)).
     """
     c = cfg or CONFIG
     start = pd.Timestamp(row["timestamp"])
@@ -155,6 +164,7 @@ def attribute_cycle(
         exec_mr = executed_fill_market_risk(fill_df, start, market.curves, c)
         m2e = mark_to_exec(fill_df, market.curves, c)
         tvm = transfer_vs_mark(xfer_df, market.curves, c)
+        ttm = transfer_timing_mr(xfer_df, start, market.curves, c)
     else:
         move = curve_move(client, start, end, c.curves)
         bid_ask, _src = load_spread_bid_ask_with_fallback(client, start, c.quotes)
@@ -162,6 +172,7 @@ def attribute_cycle(
         exec_mr = 0.0
         m2e = 0.0
         tvm = 0.0
+        ttm = 0.0
 
     stages = attach_executed(build_stages_from_row(row), fills)
     summary = stage_summary(
@@ -172,6 +183,7 @@ def attribute_cycle(
         executed_mr=exec_mr,
         mark_to_exec_pnl=m2e,
         transfer_vs_mark_pnl=tvm,
+        transfer_timing_mr_pnl=ttm,
     )
     lots = received_abs_lots(row)
 

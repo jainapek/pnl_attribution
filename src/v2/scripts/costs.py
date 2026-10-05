@@ -198,6 +198,49 @@ def transfer_vs_mark(
     return round(total, 2)
 
 
+def transfer_timing_mr(
+    transfers: pd.DataFrame,
+    cycle_start: pd.Timestamp,
+    curve_asof,
+    cfg: AppConfig | None = None,
+) -> float:
+    """Hold MR on received lots from transfer asof → cycle-start asof.
+
+    Assignment uses ``cycle_id`` or intention windows. Cycle start is
+    ``min(intention, earliest transfer)``, so this is ~0 on the first
+    transfer (lag sits in held MR). Other MR starts at that ``t_i``.
+    This fills the gap:
+
+        Σ lots × size × (mark_asof(t_i) − mark_asof(xfer_ts))
+
+    Lots already use book sign (desk buy → −). Same ASOF rule as other MR.
+    Packs are marked per consecutive 1m leg.
+    """
+    from .market_cache import _naive
+    from .transfers import iter_transfer_legs_priced
+
+    c = cfg or CONFIG
+    if transfers is None or len(transfers) == 0:
+        return 0.0
+    s1 = curve_asof.asof(cycle_start)
+    if s1 is None or s1.empty:
+        return 0.0
+    s1 = s1.copy()
+    s1.index = pd.DatetimeIndex(s1.index).normalize()
+
+    total = 0.0
+    for xfer_ts, tenor, lots, _price in iter_transfer_legs_priced(transfers):
+        s0 = curve_asof.asof(_naive(xfer_ts))
+        if s0 is None or s0.empty:
+            continue
+        s0 = s0.copy()
+        s0.index = pd.DatetimeIndex(s0.index).normalize()
+        v0 = float(s0.reindex([tenor]).fillna(0.0).iloc[0])
+        v1 = float(s1.reindex([tenor]).fillna(0.0).iloc[0])
+        total += float(lots) * c.contract.size * (v1 - v0)
+    return round(total, 2)
+
+
 def exec_cost(
     pos_df: pd.DataFrame,
     bid_ask: pd.DataFrame,

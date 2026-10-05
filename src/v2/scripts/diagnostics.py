@@ -14,6 +14,7 @@ from .transfers import (
     load_transfers_for_book_day,
     to_utc,
     transfer_lots_series,
+    transfers_for_cycles,
 )
 
 # Maps written on each intention row (peel stages + bookends)
@@ -150,7 +151,7 @@ def check_position_received_vs_transfers(
     - ``day``: one-row day totals + abs_diff
     - ``tenor``: day-level received vs transfers by front month
     - ``cycles``: per coalesced cycle-group window check
-      (``(prev_end, group_end]`` transfers vs Σ received in group)
+      (tagged ``cycle_id`` or ``(prev_end, group_end]`` vs Σ received)
     """
     intentions = load_intentions_for_day(client, asof_date, book, CONFIG.intentions)
     cycles = cycles_for_day(intentions, asof_date).reset_index(drop=True)
@@ -199,15 +200,18 @@ def check_position_received_vs_transfers(
     prev_end: pd.Timestamp | None = None
     for g in groups:
         t_end = max(to_utc(cycles.loc[i, "timestamp"]) for i in g)
+        cids = [cycles.loc[i, "cycle_id"] for i in g]
         if xf.empty:
             gap = xf
-            xfer_s = pd.Series(dtype=float)
-        elif prev_end is None:
-            gap = xf.loc[xf["ts_utc"] <= t_end]
-            xfer_s = transfer_lots_series(gap)
         else:
-            gap = xf.loc[(xf["ts_utc"] > prev_end) & (xf["ts_utc"] <= t_end)]
-            xfer_s = transfer_lots_series(gap)
+            gap = transfers_for_cycles(
+                xf, cids, t_end, prev_end, timestamp_col="ts_utc"
+            )
+        xfer_s = (
+            pd.Series(dtype=float)
+            if gap is None or gap.empty
+            else transfer_lots_series(gap)
+        )
 
         recv_s = pd.Series(dtype=float)
         for i in g:

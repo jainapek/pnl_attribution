@@ -3,7 +3,13 @@
 from .config import CONFIG, load_config
 from .client import get_ch_client
 from .cycle_attribution import attribute_cycle, stage_summary, with_cents_per_bbl
-from .day_attribution import attribute_all_books_day, attribute_book_day
+from .overnight import compute_outside_cycle_mr
+from .day_attribution import (
+    attribute_all_books_day,
+    attribute_book_day,
+    load_library_eod_pnl,
+    load_library_m2m_trade,
+)
 from .diagnostics import (
     check_intention_lot_sums,
     check_position_received_vs_transfers,
@@ -37,6 +43,9 @@ __all__ = [
     "with_cents_per_bbl",
     "attribute_book_day",
     "attribute_all_books_day",
+    "load_library_eod_pnl",
+    "load_library_m2m_trade",
+    "compute_outside_cycle_mr",
     "check_intention_lot_sums",
     "check_position_received_vs_transfers",
     "check_position_received_vs_transfers_range",

@@ -16,7 +16,7 @@ from .market_cache import (
     load_quote_cache_for_day,
 )
 from .trades import executed_lots_series, load_trades_for_book_day
-from .transfers import load_transfers_for_book_day
+from .transfers import assign_transfers_to_cycles, load_transfers_for_book_day
 from .costs import executed_fill_market_risk_by_instrument
 
 
@@ -53,11 +53,15 @@ def attribute_book_day(
     """All cycles for one book / day.
 
     Prefetches curves + quote minute-bars once (unless ``market`` is passed),
-    then attributes in-process. Also loads the day's nexus trades and
-    transfers once so each cycle gets:
+    Cycle start is ``min(intention timestamp, earliest assigned transfer)``
+    so transfer→reporting lag sits in held MR, not a separate timing bucket.
+    Cycle ends tessellate. Also loads the day's nexus trades and transfers
+    once so each cycle gets:
     - fills in ``(timestamp, next_cycle_start]`` → unexecuted / executed MR /
       mark_to_exec
-    - transfers in ``(prev_cycle, timestamp]`` → transfer_vs_mark
+    - transfers tagged with ``cycle_id`` → that cycle; untagged rows in
+      ``(prev_intention, this_intention]`` → transfer_vs_mark /
+      transfer_timing_mr (timing is ~0 on the first transfer)
 
     Index: ``cycle_id`` (+ ``DAY TOTAL``).
     Columns: MultiIndex ``(unit, stage, component)`` with ``unit`` in
@@ -69,10 +73,6 @@ def attribute_book_day(
         return _empty_book_frame(c)
 
     cycles = cycles_for_day(intentions, asof_date)
-    cycle_times = [
-        pd.Timestamp(t)
-        for t in pd.concat([cycles["timestamp"], cycles["next_cycle_start"]])
-    ]
 
     trades = load_trades_for_book_day(client, book, asof_date)
     fill_times: list[pd.Timestamp] = []
@@ -89,6 +89,12 @@ def attribute_book_day(
         transfers = transfers.copy()
         transfers["timestamp"] = [_naive_utc(t) for t in transfers["timestamp"]]
         xfer_times = [pd.Timestamp(t) for t in transfers["timestamp"]]
+
+    cycles, xfer_gaps = assign_transfers_to_cycles(cycles, transfers)
+    cycle_times = [
+        pd.Timestamp(t)
+        for t in pd.concat([cycles["timestamp"], cycles["next_cycle_start"]])
+    ]
 
     extra_asof = fill_times + xfer_times
     if market is None:
@@ -110,8 +116,9 @@ def attribute_book_day(
     rows: list[pd.Series] = []
     lots: list[float] = []
     ids: list = []
-    prev_ts: pd.Timestamp | None = None
-    for i, (_, row) in enumerate(cycles.iterrows(), start=1):
+    for i, ((_, row), xfer_gap) in enumerate(
+        zip(cycles.iterrows(), xfer_gaps), start=1
+    ):
         t0 = _naive_utc(row["timestamp"])
         t1 = _naive_utc(row["next_cycle_start"])
         if trades.empty:
@@ -123,16 +130,6 @@ def attribute_book_day(
                 & (trades["transaction_timestamp"] <= t1)
             ]
             fills = executed_lots_series(gap)
-
-        if transfers.empty:
-            xfer_gap = transfers
-        elif prev_ts is None:
-            xfer_gap = transfers[transfers["timestamp"] <= t0]
-        else:
-            xfer_gap = transfers[
-                (transfers["timestamp"] > prev_ts)
-                & (transfers["timestamp"] <= t0)
-            ]
 
         s, abs_traded = attribute_cycle(
             client,
@@ -146,7 +143,6 @@ def attribute_book_day(
         rows.append(s)
         lots.append(abs_traded)
         ids.append(row["cycle_id"])
-        prev_ts = t0
         if progress_every and i % progress_every == 0:
             print(f"  {book}: {i}/{len(cycles)} cycles")
 
@@ -188,6 +184,11 @@ def executed_mr_by_instrument_book_day(
         return pd.DataFrame(columns=["executed_mr", "n_fills", "abs_lots"])
 
     cycles = cycles_for_day(intentions, asof_date)
+    transfers = load_transfers_for_book_day(client, book, asof_date)
+    if not transfers.empty:
+        transfers = transfers.copy()
+        transfers["timestamp"] = [_naive_utc(t) for t in transfers["timestamp"]]
+    cycles, _xfer_gaps = assign_transfers_to_cycles(cycles, transfers)
     cycle_times = [
         pd.Timestamp(t)
         for t in pd.concat([cycles["timestamp"], cycles["next_cycle_start"]])
@@ -338,3 +339,52 @@ def attribute_all_books_day(
         [("TEAM", "TOTAL")], names=["book", "cycle_id"]
     )
     return pd.concat([out, team])
+
+
+def load_library_eod_pnl(
+    client: Client,
+    asof_date: date,
+    book: str,
+) -> dict[str, float] | None:
+    """EOD library PnL for one book / day.
+
+    Last ``tenor='total'`` snapshot on ``asof_date`` from
+    ``algo.nexus_pnl_attribution``.
+
+        gross = overnight + m2m_pnl + trade_pnl
+    """
+    raw = client.query_df(
+        f"""
+        SELECT overnight, m2m_pnl, trade_pnl, gross
+        FROM algo.nexus_pnl_attribution
+        WHERE book_name = '{book}'
+          AND tenor = 'total'
+          AND toDate(timestamp) = toDate('{asof_date}')
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """
+    )
+    if raw is None or raw.empty:
+        return None
+    row = raw.iloc[0]
+    out = {
+        "overnight": float(row["overnight"]),
+        "m2m_pnl": float(row["m2m_pnl"]),
+        "trade_pnl": float(row["trade_pnl"]),
+        "gross": float(row["gross"]),
+    }
+    if any(pd.isna(v) for v in out.values()):
+        return None
+    return out
+
+
+def load_library_m2m_trade(
+    client: Client,
+    asof_date: date,
+    book: str,
+) -> float | None:
+    """EOD library ``m2m_pnl + trade_pnl`` (no overnight)."""
+    lib = load_library_eod_pnl(client, asof_date, book)
+    if lib is None:
+        return None
+    return lib["m2m_pnl"] + lib["trade_pnl"]
