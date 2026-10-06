@@ -23,6 +23,64 @@ def parse_brn_calendar(instrument_key: str) -> tuple[pd.Timestamp, pd.Timestamp]
     return start, end
 
 
+def is_decdec_calendar(instrument_key: str) -> bool:
+    """True for Dec–Dec calendars (``ICE BRN DecYY-DecYY Calendar``)."""
+    parsed = parse_brn_calendar(instrument_key)
+    if parsed is None:
+        return False
+    start, end = parsed
+    return int(start.month) == 12 and int(end.month) == 12
+
+
+def calendar_strip_name(instrument_key: str) -> str | None:
+    """``ICE BRN Dec26-Dec27 Calendar`` → ``Dec26/Dec27`` (mdc strip_name)."""
+    m = _BRN_CAL.match(str(instrument_key).strip())
+    if not m:
+        return None
+    return f"{m.group('start')}/{m.group('end')}"
+
+
+def load_parent_init_from_tt_audit(
+    client: Client,
+    parent_ids: list[str],
+    asof_date: date,
+) -> pd.DataFrame:
+    """First TT ``NEW`` per parent_id (UTC). Empty frame if none."""
+    ids = [str(p) for p in parent_ids if p and str(p) not in ("(none)", "nan", "None")]
+    if not ids:
+        return pd.DataFrame(columns=["parent_id", "t_init", "b_s"])
+    in_list = ",".join(f"'{p}'" for p in ids)
+    return client.query_df(
+        f"""
+        SELECT
+            parent_id,
+            min(event_timestamp) AS t_init,
+            argMin(b_s, event_timestamp) AS b_s
+        FROM algo.tt_audit
+        WHERE parent_id IN ({in_list})
+          AND exec_type = 'NEW'
+          AND message_type = 'EXECUTION_REPORT'
+          AND toDate(event_timestamp) >= toDate('{asof_date}') - 1
+          AND toDate(event_timestamp) <= toDate('{asof_date}')
+        GROUP BY parent_id
+        """
+    )
+
+
+def is_dec26_dec27_calendar(instrument_key: str) -> bool:
+    """True for ``ICE BRN Dec26-Dec27 Calendar`` only."""
+    parsed = parse_brn_calendar(instrument_key)
+    if parsed is None:
+        return False
+    start, end = parsed
+    return (
+        int(start.month) == 12
+        and int(end.month) == 12
+        and int(start.year) == 2026
+        and int(end.year) == 2027
+    )
+
+
 def pack_to_consecutive_lots(start: pd.Timestamp, end: pd.Timestamp, lots: float) -> pd.Series:
     """Multi-month pack → consecutive 1m spread lots.
 
@@ -179,6 +237,7 @@ def load_trades_for_book_day(
             price,
             text_tt,
             text_c,
+            parent_id,
             splitByChar(',', text_c)[3] AS cycle_id
         FROM algo.nexus_trades
         WHERE text_tt = '{book}'

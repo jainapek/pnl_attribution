@@ -218,20 +218,33 @@ def load_transfers_for_book_day(
     asof_date: date,
     *,
     exclude_eod_roll: bool = True,
+    include_outbound: bool = False,
 ) -> pd.DataFrame:
-    """Raw ``algo.nexus_transfers`` for one receiving book / London calendar day.
+    """Raw ``algo.nexus_transfers`` for one book / London calendar day.
 
-    ``source_book`` is the Nexus book that receives the risk. Desk deals are
-    duplicated across books (e.g. Hedger Spreads + Spreadgr Base 2).
+    ``source_book`` is the Nexus book that **receives** the risk. Desk deals
+    are duplicated across books (e.g. Hedger Spreads + Spreadgr Base 2).
 
-    When ``exclude_eod_roll`` is True, drops ``toHour(timestamp) >= 21``
-    (London) — the end-of-day internal roll, not desk flow.
+    When ``include_outbound`` is True, also loads rows this desk **sent** to
+    another book (``desk = book`` and ``source_book != book``) — e.g. the
+    21:00 Hedger Spread Roller onto Spreadgr Base 2, which never appears as
+    a Hedger ``source_book`` row. Those rows get ``outbound=True``; lot sign
+    must be flipped vs the receiver.
 
-    ``cycle_id`` is selected when present on the table: null → assign by
-    timestamp window; set → assign by that cycle.
+    When ``exclude_eod_roll`` is True, drops inbound ``toHour(timestamp) >= 21``
+    (UTC wall — legacy). Outbound rolls are not dropped.
     """
     hour_filter = "AND toHour(timestamp) < 21" if exclude_eod_roll else ""
-    return client.query_df(
+    if include_outbound:
+        book_filter = f"""
+          AND (
+            (source_book = '{book}' {hour_filter})
+            OR (desk = '{book}' AND source_book != '{book}')
+          )
+        """
+    else:
+        book_filter = f"AND source_book = '{book}' {hour_filter}"
+    raw = client.query_df(
         f"""
         SELECT
             timestamp,
@@ -249,11 +262,34 @@ def load_transfers_for_book_day(
             cycle_id
         FROM algo.nexus_transfers
         WHERE toDate(timestamp) = '{asof_date}'
-          AND source_book = '{book}'
-          {hour_filter}
+          {book_filter}
         ORDER BY timestamp
         """
     )
+    if raw is None or raw.empty:
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "id",
+                "desk",
+                "trader",
+                "start_tenor",
+                "end_tenor",
+                "price",
+                "quantity",
+                "side",
+                "source_book",
+                "mark",
+                "edge_applied",
+                "cycle_id",
+                "outbound",
+            ]
+        )
+    out = raw.copy()
+    out["outbound"] = (out["desk"].astype(str) == book) & (
+        out["source_book"].astype(str) != book
+    )
+    return out
 
 
 def transfer_lots_series(transfers: pd.DataFrame) -> pd.Series:

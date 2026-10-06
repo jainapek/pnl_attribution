@@ -1,11 +1,10 @@
-# Nexus cycle attribution — shared constants
+# Nexus sleeve attribution — shared constants
 
 [contract]
 size = 1000                 # barrels per lot
-clearing_rate = 0.0019      # $/bbl exchange / clearing add-on
 
 [books]
-# name → tradr book_id (reference; intentions are keyed by book name)
+# name → tradr book_id
 "Hedger Spreads" = 129
 "Spreadgr Base" = 318
 "Spreadgr Alt 1" = 309
@@ -17,47 +16,9 @@ clearing_rate = 0.0019      # $/bbl exchange / clearing add-on
 "Spreadgr Base 3" = 340
 "Spreadgr Base 4" = 343
 
-[stages]
-# TOTAL is synthesized; peel order for day tables
-order = ["TOTAL", "transfer_pred", "pca", "routing", "executed"]
-peels = ["transfer_pred", "pca", "routing"]
-# executed is not a peel: held_market_risk marks unexecuted; executed_market_risk
-# marks fills from cycle-start curve to curve at each fill time
-
-[summary_components]
-# columns under each stage in the day / book summary table
-# value_added = in_exec − out_exec + held_market_risk + executed_market_risk
-#               + mark_to_exec + transfer_vs_mark + transfer_timing_mr − held_exec_save
-# all exec_* are cashflows (+ = money in)
-# market-risk columns: vs cycle-start mark (later − start); + = gain on longs (library m2m)
-# mark_to_exec: fill vs curve at fill (price/n per 1m leg); executed stage only
-# transfer_vs_mark: transfer deal vs nexus_transfers.mark (price/n); ≈ −edge; transfer_pred only
-# transfer_timing_mr: algo.curves asof(xfer) → asof(cycle start); ~0 after start=min(intention, first xfer)
-order = [
-  "in_exec_cost",
-  "out_exec_cost",
-  "held_market_risk",
-  "executed_market_risk",
-  "mark_to_exec",
-  "transfer_vs_mark",
-  "transfer_timing_mr",
-  "held_exec_save",
-  "value_added_by_strategy",
-]
-
 [curves]
 product = "Brent_(Fut)"
 table = "algo.curves"
-
-[quotes]
-# prefer mdc; fall back to mdcoll
-primary_table = "mdc.top5pl"
-primary_price_scale = 100.0
-fallback_table = "mdcoll.brn_top5pl"
-fallback_price_scale = 1.0
-lookback_minutes = 30
-hub_alias = "North Sea"
-security_sub_type = "SPR"
 
 [intentions]
 table = "algo.nexus_book_position_intentions_v1"
