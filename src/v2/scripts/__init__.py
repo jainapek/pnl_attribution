@@ -1,4 +1,4 @@
-"""No-roll sleeve attribution on the running Hedger Spreads book."""
+"""Event-walk sleeve attribution for Hedger Spreads."""
 
 from .client import get_ch_client
 from .config import CONFIG, load_config
@@ -13,6 +13,7 @@ from .sleeve_attribution import (
     SLEEVE_COLS,
     assign_transfers_to_cycles,
     attribute_day_sleeves,
+    attribute_range_by_cycle,
     attribute_range_vs_library,
     compute_timing_mr,
 )
@@ -31,4 +32,5 @@ __all__ = [
     "compute_timing_mr",
     "attribute_day_sleeves",
     "attribute_range_vs_library",
+    "attribute_range_by_cycle",
 ]

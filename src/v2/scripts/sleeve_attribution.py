@@ -1,14 +1,8 @@
-"""No-roll sleeve attribution on the running book (benchmark path).
+"""Transfer assignment + day/range sleeve drivers.
 
-Components (day total):
-  overnight (once)
-  + timing_mr
-  + pca_held_mr
-  + fill_mr
-  + mark_to_fill
-  + unexecuted_mr
-
-Outbound Hedger → Spreadgr Base 2 is not a sleeve.
+Day sleeves are the event-walk split in ``event_walk_sleeves``:
+overnight + timing + pca_held_mr + fill_mr + mark_to_fill + unexecuted
+(with Base2 outbound entry BV inside unexecuted).
 """
 
 from __future__ import annotations
@@ -20,16 +14,7 @@ import pandas as pd
 from clickhouse_connect.driver import Client
 
 from .config import CONFIG, AppConfig
-from .intentions import load_intentions_for_day
-from .library import load_library_eod_pnl
 from .market_cache import load_curve_asof_many
-from .position_timeline import (
-    build_position_timeline,
-    stamp_cycle_component_mr_on_timeline,
-    stamp_overnight_on_timeline,
-    stamp_pca_held_on_timeline,
-    stamp_timing_mr_on_timeline,
-)
 from .trades import pack_to_consecutive_lots
 from .transfers import book_signed_qty, naive_utc, normalize_cycle_id
 
@@ -227,34 +212,16 @@ def attribute_day_sleeves(
     book: str,
     assigned: pd.DataFrame,
     cfg: AppConfig | None = None,
-) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Build ledger + no-roll sleeves for one day.
+) -> tuple[pd.DataFrame, dict]:
+    """Split event-walk gross into six sleeves (exact allocation).
 
-    Returns ``(tl_mr, totals)`` where ``totals`` has sleeve columns + ``ours``.
+    See ``event_walk_sleeves.attribute_day_event_walk_sleeves``.
     """
-    c = cfg or CONFIG
-    tl = build_position_timeline(client, asof_date, book, c)
-    if tl.empty:
-        zeros = {k: 0.0 for k in SLEEVE_COLS}
-        zeros["ours"] = 0.0
-        return tl, zeros
+    from .event_walk_sleeves import attribute_day_event_walk_sleeves
 
-    tl_mr = stamp_overnight_on_timeline(client, tl, asof_date, book, c)
-    tl_mr = stamp_timing_mr_on_timeline(tl_mr, assigned)
-    intents = load_intentions_for_day(client, asof_date, book, c.intentions)
-    tl_mr = stamp_pca_held_on_timeline(tl_mr, intents)
-    tl_mr = stamp_cycle_component_mr_on_timeline(client, tl_mr, intents, c)
-
-    totals = {
-        "overnight": float(tl_mr["overnight"].iloc[0]),
-        "timing_mr": float(tl_mr["timing_mr"].sum()),
-        "pca_held_mr": float(tl_mr["pca_held_mr"].sum()),
-        "fill_mr": float(tl_mr["fill_mr"].sum()),
-        "mark_to_fill": float(tl_mr["mark_to_fill"].sum()),
-        "unexecuted_mr": float(tl_mr["unexecuted_mr"].sum()),
-    }
-    totals["ours"] = round(sum(totals[k] for k in SLEEVE_COLS), 2)
-    return tl_mr, totals
+    return attribute_day_event_walk_sleeves(
+        client, asof_date, book, assigned=assigned, cfg=cfg
+    )
 
 
 def attribute_range_vs_library(
@@ -264,34 +231,23 @@ def attribute_range_vs_library(
     end: date | None = None,
     cfg: AppConfig | None = None,
 ) -> pd.DataFrame:
-    """No-roll sleeve totals vs library gross for each day with library EOD."""
-    end = end or date.today()
-    assigned = assign_transfers_to_cycles(client, book, start, end, cfg)
-    assigned = compute_timing_mr(client, assigned, cfg)
+    """Sleeve totals vs event-walk / library gross for each day with library EOD."""
+    from .event_walk_sleeves import attribute_range_event_walk_sleeves
 
-    rows: list[dict] = []
-    for d in pd.date_range(start, end, freq="D").date.tolist():
-        lib = load_library_eod_pnl(client, d, book)
-        if lib is None:
-            continue
-        intents = load_intentions_for_day(client, d, book)
-        if intents is None or intents.empty:
-            continue
-        _tl, totals = attribute_day_sleeves(client, d, book, assigned, cfg)
-        if _tl.empty:
-            continue
-        lib_g = round(float(lib["gross"]), 2)
-        diff = round(totals["ours"] - lib_g, 2)
-        rows.append(
-            {
-                "date": d,
-                **{k: totals[k] for k in SLEEVE_COLS},
-                "ours": totals["ours"],
-                "library_gross": lib_g,
-                "diff": diff,
-            }
-        )
-    return pd.DataFrame(rows)
+    return attribute_range_event_walk_sleeves(client, book, start, end, cfg)
+
+
+def attribute_range_by_cycle(
+    client: Client,
+    book: str,
+    start: date,
+    end: date | None = None,
+    cfg: AppConfig | None = None,
+) -> pd.DataFrame:
+    """Per-cycle sleeve PnL across days. See ``event_walk_sleeves``."""
+    from .event_walk_sleeves import attribute_range_by_cycle as _impl
+
+    return _impl(client, book, start, end, cfg)
 
 
 __all__ = [
@@ -300,4 +256,5 @@ __all__ = [
     "compute_timing_mr",
     "attribute_day_sleeves",
     "attribute_range_vs_library",
+    "attribute_range_by_cycle",
 ]
